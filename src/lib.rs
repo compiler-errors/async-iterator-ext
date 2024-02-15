@@ -1,9 +1,29 @@
-#![feature(async_iterator, async_closure, gen_blocks, async_for_loop, extend_one)]
+#![feature(async_iterator, async_closure, gen_blocks, async_for_loop)]
+#![feature(extend_one, future_join)]
 #![allow(async_fn_in_trait)]
 
-use std::{async_iter::AsyncIterator, pin::Pin};
+use std::async_iter::AsyncIterator;
+use std::future::{join, Future};
+use std::pin::{pin, Pin};
 
 pub trait AsyncIteratorExt: AsyncIterator {
+    fn next(&mut self) -> impl Future<Output = Option<Self::Item>>
+    where
+        Self: Unpin,
+    {
+        Next { t: self }
+    }
+
+    async fn into_future(mut self) -> impl Future<Output = (Option<Self::Item>, Self)>
+    where
+        Self: Sized + Unpin,
+    {
+        async move {
+            let item = self.next().await;
+            (item, self)
+        }
+    }
+
     fn map<T, F>(self, mut f: F) -> impl AsyncIterator<Item = T>
     where
         F: FnMut(Self::Item) -> T,
@@ -183,6 +203,30 @@ pub trait AsyncIteratorExt: AsyncIterator {
         }
     }
 
+    /* TOO LAZY TO IMPL, NEED BUFFER
+    fn flatten(self) -> impl AsyncIterator<Item = <Self::Item as AsyncIterator>::Item>
+    where
+        Self::Item: AsyncIterator,
+        Self: Sized;
+    */
+
+    /* NEED ASYNC GEN FN FOR FULL FLEXIBILITY
+    fn flat_map<F, T>(self, f: F) -> impl AsyncIterator<Item = T>
+    where
+        F: async gen FnMut() -> T
+    {
+        for await x in self {
+            for await y in f(x) {
+                yield y;
+            }
+        }
+    }
+
+    fn flat_map_unordered<F, T>(self, f: F, limit: usize) -> impl AsyncIterator<Item = T>
+    where
+        F: async gen FnMut() -> T;
+    */
+
     fn scan<S, B, F>(self, mut initial_state: S, mut f: F) -> impl AsyncIterator<Item = B>
     where
         F: async FnMut(&mut S, Self::Item) -> Option<B>,
@@ -235,6 +279,13 @@ pub trait AsyncIteratorExt: AsyncIterator {
         }
     }
 
+    /* NEED TO select! I THINK?
+    fn take_until<Fut>(self, fut: Fut) -> impl AsyncIterator<Item = Self::Item>
+    where
+        Fut: Future,
+        Self: Sized;
+    */
+
     async fn for_each<F>(self, mut f: F)
     where
         F: async FnMut(Self::Item),
@@ -244,6 +295,13 @@ pub trait AsyncIteratorExt: AsyncIterator {
             f(x).await;
         }
     }
+
+    /*
+    async fn for_each_concurrent<F>(self, limit: usize, mut f: F)
+    where
+        F: async FnMut(Self::Item),
+        Self: Sized;
+    */
 
     fn take(self, mut n: usize) -> impl AsyncIterator<Item = Self::Item>
     where
@@ -280,6 +338,14 @@ pub trait AsyncIteratorExt: AsyncIterator {
         }
     }
 
+    /* NO FUSED STREAM TRAIT (RPITIT)
+    fn fuse
+    */
+
+    /* CAN'T EXPRESS WITH ASYNC GEN BLOCK
+    fn catch_unwind(self) -> impl AsyncIterator<Item = std::thread::Result<Self::Item>>;
+    */
+
     fn boxed<'a>(self) -> Pin<Box<dyn AsyncIterator<Item = Self::Item> + Send + 'a>>
     where
         Self: Sized + Send + 'a,
@@ -292,6 +358,53 @@ pub trait AsyncIteratorExt: AsyncIterator {
         Self: Sized + 'a,
     {
         Box::pin(self)
+    }
+
+    /*
+    fn buffered(self, n: usize) -> impl AsyncIterator<Item = Self::Item>;
+    fn buffered_unordered(self, n: usize) -> impl AsyncIterator<Item = Self::Item>;
+    */
+
+    fn zip<St>(self, other: St) -> impl AsyncIterator<Item = (Self::Item, St::Item)>
+    where
+        St: AsyncIterator,
+        Self: Sized,
+    {
+        async gen move {
+            let mut self_ = pin!(self);
+            let mut other = pin!(other);
+            loop {
+                if let (Some(a), Some(b)) = join!(self_.next(), other.next()).await {
+                    yield (a, b);
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+
+    /* NEEDS METHODS ON RETURNED STREAM
+    fn peekable
+    */
+
+    fn chunks(self, capacity: usize) -> impl AsyncIterator<Item = Vec<Self::Item>>
+    where
+        Self: Sized,
+    {
+        assert_ne!(capacity, 0);
+        async gen move {
+            let mut chunk = vec![];
+            for await x in self {
+                chunk.push(x);
+                if chunk.len() == capacity {
+                    yield chunk;
+                    chunk = vec![];
+                }
+            }
+            if !chunk.is_empty() {
+                yield chunk;
+            }
+        }
     }
 
     fn chain<St>(self, other: St) -> impl AsyncIterator<Item = Self::Item>
@@ -308,6 +421,47 @@ pub trait AsyncIteratorExt: AsyncIterator {
             }
         }
     }
+
+    fn inspect<F>(self, mut f: F) -> impl AsyncIterator<Item = Self::Item>
+    where
+        F: FnMut(&Self::Item),
+        Self: Sized,
+    {
+        async gen move {
+            for await x in self {
+                f(&x);
+                yield x;
+            }
+        }
+    }
+
+    fn async_inspect<F>(self, mut f: F) -> impl AsyncIterator<Item = Self::Item>
+    where
+        F: async FnMut(&Self::Item),
+        Self: Sized,
+    {
+        async gen move {
+            for await x in self {
+                f(&x).await;
+                yield x;
+            }
+        }
+    }
 }
 
 impl<T: AsyncIterator> AsyncIteratorExt for T {}
+
+struct Next<'a, T: ?Sized> {
+    t: &'a mut T,
+}
+
+impl<T: Unpin + AsyncIterator + ?Sized> std::future::Future for Next<'_, T> {
+    type Output = Option<T::Item>;
+
+    fn poll(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        Pin::new(&mut self.t).poll_next(cx)
+    }
+}
